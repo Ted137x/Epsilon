@@ -49,7 +49,7 @@ function rotate_z(p, angle)
 
 // Takes an array of Point3Ds then rotates it across 3th 
 // demention and returns a 2D projection of those 3D
-// points as an array of Point2Ds
+// points as an array of Point2Ds .
 
 export function project (arr, ax, ay, az, size, FOV) {
   let result = [];
