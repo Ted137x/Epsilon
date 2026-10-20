@@ -1,0 +1,99 @@
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #17191e;
+  color: #e8eaf0;
+}
+
+button {
+  background: #343842;
+  color: inherit;
+  border: 1px solid #484d59;
+  border-radius: 6px;
+  padding: 8px 10px;
+  cursor: pointer;
+}
+
+.editor {
+  height: 100vh;
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr) 240px;
+  grid-template-rows: 52px minmax(0, 1fr) 240px 240px;
+  grid-template-areas:
+    "topbar topbar topbar"
+    "assets workspace inspector"
+    "assets workspace emulator"
+    "curves timeline timeline";
+  gap: 1px;
+  background: #3b3e47;
+}
+
+.topbar {
+  grid-area: topbar;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 0 16px;
+  background: #24262d;
+}
+
+.topbar nav {
+  display: flex;
+  gap: 8px;
+}
+
+.panel {
+  background: #24262d;
+  padding: 12px;
+  overflow: auto;
+}
+
+.assets { grid-area: assets; }
+.workspace {
+  grid-area: workspace;
+  background: #191b20;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.emulator { grid-area: emulator; }
+
+.curves { grid-area: curves; }
+
+.inspector { grid-area: inspector; }
+.timeline { grid-area: timeline; }
+
+.canvas-header {
+  padding: 12px;
+  background: #24262d;
+}
+
+#preview {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+#preview canvas {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.assets button {
+  display: block;
+  width: 100%;
+  margin-bottom: 8px;
+  text-align: left;
+}
