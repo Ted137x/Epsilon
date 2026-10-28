@@ -1,6 +1,8 @@
-import {curvesCanvas} from "./scr/curves.js";
-import {emulatorCanvas} from "./scr/emulator.js";
+import { curvesCanvas } from "./scr/curves.js";
+import { emulatorCanvas } from "./scr/emulator.js";
+import { editorCanvas } from "./scr/editor.js";
 
 new p5(curvesCanvas, curves);
 new p5(emulatorCanvas, emulator);
-//test
+new p5(editorCanvas, editor);
+
