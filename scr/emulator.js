@@ -115,7 +115,7 @@ export function emulatorCanvas(p){
           screenTestPolygon[(i+1) % screenTestPolygon.length].x,
           screenTestPolygon[(i+1) % screenTestPolygon.length].y);
     }
-    console.log(screenTestPolygon);
+
     if(showCube){
       print2DPolygon(p, screenTestPolygon);  
     }
