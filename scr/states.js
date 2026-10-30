@@ -1,11 +1,4 @@
-class curvePoints {
-    constructor(x1 = 0, y1 = 0, x2 = 0, y2 = 0) {
-        this.x1 = x1;
-        this.y1 = y1;
-        this.x2 = x2;
-        this.y2 = y2;
-    }
-}
+
 
 class animationPoint {
     constructor() {
@@ -35,7 +28,8 @@ class animationPolygon {
 
 // The main project file that contains every object on the screen
 export const animationData = {
-    polygons: []
+    polygons: [],
+    duration: 5
 };
 
 
@@ -68,16 +62,43 @@ export function addPointToPolygon (polygon, x, y, z, time){
 
 
 
+function makeTest1() {
+  const polygon = new animationPolygon();
+  polygon.colorKeyframes.push("#9C4D00");
+  polygon.colorKeyframeTimes.push(0);
+  const pi = Math.PI;
+
+  for (let i = 0; i < 60; ++i) {
+    const angle = 2 * pi * i / 60;
+    const cosAngle = Math.cos(angle);
+    const sinAngle = Math.sin(angle);
+    const point = new animationPoint();
+
+    point.x = [-45 + 22 * cosAngle, 45 + 16 * cosAngle];
+    point.frameTimesX = [1, 4];
+    point.curvesX = [{ x1: 0.60, y1: 0.06, x2: 0.98, y2: 0.54 }];
+
+    point.y = [18 * sinAngle, 28 * sinAngle];
+    point.frameTimesY = [1, 4];
+    point.curvesY = [{ x1: 0.60, y1: 0.06, x2: 0.98, y2: 0.54 }];
+
+    point.z = [-100, -100];
+    point.frameTimesZ = [1, 4];
+    point.curvesZ = [{ x1: 0.60, y1: 0.06, x2: 0.98, y2: 0.54 }];
+
+    polygon.animationPoints.push(point);
+  }
+
+  return polygon;
+}
+
+animationData.polygons.push(makeTest1());
 
 
-
-
-
-
+// This part is not going to be saved and just helps the program work
 export const programState = {
   time: 0
 };
-
 
 
 
