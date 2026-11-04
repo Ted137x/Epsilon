@@ -61,6 +61,18 @@ export function emulatorCanvas(p){
         if (showCube){
             angleX = 0.7853 - (mouse_y/240) * 1.5707;
             angleY = 0.7853 - (mouse_x/240) * 1.5707;
+            if(angleX > 0.8){
+                angleX = 0.8;
+            }else if(angleX < -0.8){
+                angleX = -0.8;
+            }
+
+            if(angleY > 0.8){
+                angleY = 0.8;
+            }else if(angleY < -0.8){
+                angleY = -0.8;
+            }
+            
         }
           
 

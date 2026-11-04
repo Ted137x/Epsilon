@@ -68,7 +68,40 @@ button {
 .curves { grid-area: curves; }
 
 .inspector { grid-area: inspector; }
-.timeline { grid-area: timeline; }
+
+
+
+.timeline {
+  grid-area: timeline;
+  display: grid;
+  grid-template-rows: 45px minmax(0, 1fr);
+  grid-template-areas:
+    "zoombar"
+    "framebar";
+  gap: 1px;
+  background: #17191e;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+#zoombar {
+  grid-area: zoombar;
+  background: #24262d;
+}
+
+#framebar {
+  grid-area: framebar;
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: auto;
+  background: #191b20;
+}
+
+#framebarcanvas {
+  width: 100%;
+}
 
 .canvas-header {
   padding: 12px;
