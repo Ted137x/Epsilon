@@ -1,13 +1,18 @@
-import { curvesCanvas } from "./scr/curves.js";
+import { curvesCanvas, setupCurvePresets } from "./scr/curves.js";
 import { emulatorCanvas } from "./scr/emulator.js";
 import { editorCanvas } from "./scr/editor.js";
-import { timelineZoomCanvas } from "./scr/timeline.js";
-import { timelineFrameCanvas } from "./scr/timeline.js";
+import { timelineZoomCanvas, timelineFrameCanvas } from "./scr/timeline.js";
+import { setupInspector } from "./scr/inspector.js";
+import { setupUI } from "./scr/ui.js";
 
-new p5(curvesCanvas, curves);
-new p5(emulatorCanvas, emulator);
-new p5(editorCanvas, editor);
-new p5(timelineZoomCanvas, zoombar);
-new p5(timelineFrameCanvas, framebar);
+const at = (id) => document.getElementById(id);
 
+setupUI();
+setupInspector();
+setupCurvePresets();
 
+new p5(curvesCanvas, at("curves"));
+new p5(emulatorCanvas, at("emulator"));
+new p5(editorCanvas, at("editor"));
+new p5(timelineZoomCanvas, at("zoombar"));
+new p5(timelineFrameCanvas, at("framebar"));
