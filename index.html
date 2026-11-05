@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -13,44 +12,50 @@
     <header class="topbar">
       <strong>Epsilon</strong>
       <nav>
-        <button>Project</button>
-        <button>Edit</button>
-        <button>Import</button>
-        <button>Export</button>
+        <button id="btn-new">New</button>
+        <button id="btn-open">Open</button>
+        <button id="btn-save">Save</button>
+        <span class="sep"></span>
+        <button id="btn-undo" title="Ctrl+Z">Undo</button>
+        <button id="btn-redo" title="Ctrl+Y">Redo</button>
+        <span class="sep"></span>
+        <button id="btn-export-h" title="C header for the firmware">Export .h</button>
+        <button id="btn-export-bin">Export .bin</button>
       </nav>
+      <button id="btn-play" title="Space">Pause</button>
+      <span id="clock">0.00 s</span>
+      <span id="status" role="status"></span>
+      <input id="file-open" type="file" accept=".json" hidden />
     </header>
 
     <aside class="assets panel">
+      <h3>Tools</h3>
+      <div id="tools" class="tools"></div>
+      <label class="check"><input id="onion" type="checkbox" /> Onion skin</label>
       <h3>Objects</h3>
-      <button data-sketch="sketchA">Sketch A</button>
-      <button data-sketch="sketchB">Sketch B</button>
+      <div id="objects"></div>
     </aside>
 
     <main class="editor">
       <div id="editor"></div>
     </main>
 
+    <aside class="inspector panel" id="inspector"></aside>
+
     <aside class="emulator">
-        <div id="emulator"></div>
+      <div id="emulator"></div>
     </aside>
 
     <aside class="curves">
-        <div id="curves"></div>
-    </aside>
-
-    <aside class="inspector panel">
-      <h3>Inspector</h3>
-      <p>Select an object to edit its properties.</p>
+      <div id="curves"></div>
+      <div id="curve-presets"></div>
     </aside>
 
     <div class="timeline">
       <div id="zoombar"></div>
-      <div id="framebar">
-        <div id="framebarcanvas"></div>
-      </div>
+      <div id="framebar"></div>
     </div>
   </div>
-
 
   <script type="module" src="main.js"></script>
 </body>

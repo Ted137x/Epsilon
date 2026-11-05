@@ -1,149 +1,113 @@
-import {Point3D, Point2D, project, print2DPolygon, inverseX, cubicCurveProgress, animate} from "./functions.js";
-import { animationData } from "./states.js";
+// Plays the real compiled binary through the integer renderer, so this canvas shows
+// exactly the pixels the display will show.
+import { project, programState as st } from "./states.js";
+import { compile, pack } from "./compiler.js";
+import { Player, SIZE } from "./player.js";
 
+const TO_UNITS = 65536 / (2 * Math.PI);
+const CUBE = [[-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1], [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]];
+const EDGES = [[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7]];
 
-
-const cube = [
-    new Point3D(-100, -100, -100),
-    new Point3D( 100, -100, -100),
-    new Point3D( 100,  100, -100),
-    new Point3D(-100,  100, -100),
-    new Point3D(-100, -100,  100),
-    new Point3D( 100, -100,  100),
-    new Point3D( 100,  100,  100),
-    new Point3D(-100,  100,  100)
-];
-
-let screenCube = [];
-
-
-
-
-const FOV = 250;
-const size = 150;
-
-
-let showCube = false;
-
-let angleX = 0;
-let angleY = 0;
-let angleZ = 0;
-
-let time = 0;
-let animationTime = 0;
-
-
-
-
-
-
-
-export function emulatorCanvas(p){
-    p.setup = function(){
-        p.createCanvas(240, 240);
-    }
-
-
-
-    p.draw = function(){
-
-        p.background(0);
-        p.stroke(255, 255, 0);
-        p.fill(255,255,0,200);
-
-        time += p.deltaTime/1000;
-        animationTime = time % animationData.duration;
-        p.text(animationTime.toFixed(2), 10, 20);
-        
-        let mouse_x = p.mouseX;
-        let mouse_y = p.mouseY;
-
-        if (showCube){
-            angleX = 0.7853 - (mouse_y/240) * 1.5707;
-            angleY = 0.7853 - (mouse_x/240) * 1.5707;
-            if(angleX > 0.8){
-                angleX = 0.8;
-            }else if(angleX < -0.8){
-                angleX = -0.8;
-            }
-
-            if(angleY > 0.8){
-                angleY = 0.8;
-            }else if(angleY < -0.8){
-                angleY = -0.8;
-            }
-            
-        }
-          
-
-          
-
-
-        
-		for (let i = 0; i < animationData.polygons.length; i++)
-		{
-            p.stroke(animationData.polygons[i].colorKeyframes[0]);
-            p.strokeWeight(0.6);
-			print2DPolygon(p, project(animate(animationData.polygons[i], animationTime), 
-			angleX, angleY, angleZ, size, FOV), animationData.polygons[i].colorKeyframes[0]);
-		}
-
-
-
-
-
-
-          
-
-        if (showCube) {
-            screenCube = project(cube, angleX, angleY, angleZ, size, FOV);
-            p.stroke(255,255,255, 100);
-            p.line(screenCube[0].x, screenCube[0].y, screenCube[1].x, screenCube[1].y);
-            p.line(screenCube[1].x, screenCube[1].y, screenCube[2].x, screenCube[2].y);
-            p.line(screenCube[2].x, screenCube[2].y, screenCube[3].x, screenCube[3].y);
-            p.line(screenCube[3].x, screenCube[3].y, screenCube[0].x, screenCube[0].y);
-
-            p.line(screenCube[4].x, screenCube[4].y, screenCube[5].x, screenCube[5].y);
-            p.line(screenCube[5].x, screenCube[5].y, screenCube[6].x, screenCube[6].y);
-            p.line(screenCube[6].x, screenCube[6].y, screenCube[7].x, screenCube[7].y);
-            p.line(screenCube[7].x, screenCube[7].y, screenCube[4].x, screenCube[4].y);
-
-            p.line(screenCube[0].x, screenCube[0].y, screenCube[4].x, screenCube[4].y);
-            p.line(screenCube[1].x, screenCube[1].y, screenCube[5].x, screenCube[5].y);
-            p.line(screenCube[2].x, screenCube[2].y, screenCube[6].x, screenCube[6].y);
-            p.line(screenCube[3].x, screenCube[3].y, screenCube[7].x, screenCube[7].y);
-        }
-
-    }
-
-	p.mousePressed = () => {
-		if (p.mouseX > 0 && p.mouseX < 240 && p.mouseY > 0 && p.mouseY < 240){
-			showCube = true;
-		}
-	}
-	p.mouseReleased = () => {
-		showCube = false;
-	}
-
+// Keep in step with Spring in firmware/epsilon_firmware/epsilon_firmware.ino.
+function springStep(s, rate, dt) {
+  const { k, c, gain, max } = st.spring;
+  s.velocity += (-k * s.angle - c * s.velocity) * dt;
+  s.angle += (s.velocity - gain * rate) * dt;
+  if (Math.abs(s.angle) > max) {
+    s.angle = Math.sign(s.angle) * max;
+    s.velocity = 0;
+  }
 }
 
+export const compileState = { result: null };
 
+export function emulatorCanvas(p) {
+  let player = null, builtRev = -1, builtVariant = -1, image;
+  const sx = { angle: 0, velocity: 0 }, sy = { angle: 0, velocity: 0 };
+  let dragging = false, lastX = 0, lastY = 0;
 
+  function rebuild() {
+    builtRev = st.rev;
+    builtVariant = st.variant;
+    const result = compile(project);
+    compileState.result = result;
+    if (result.errors.length) return;
+    player = new Player(pack([result.bytes]));
+    player.load(0, st.variant);
+  }
 
+  function blit() {
+    image.loadPixels();
+    const px = image.pixels, fb = player.fb;
+    for (let i = 0; i < fb.length; i++) {
+      const c = fb[i], o = i * 4;
+      px[o] = ((c >> 11) * 527 + 23) >> 6;
+      px[o + 1] = (((c >> 5) & 63) * 259 + 33) >> 6;
+      px[o + 2] = ((c & 31) * 527 + 23) >> 6;
+      px[o + 3] = 255;
+    }
+    image.updatePixels();
+    p.image(image, 0, 0);
+  }
 
+  function drawCube() {
+    const [ca, sa, cb, sb] = [Math.cos(sx.angle), Math.sin(sx.angle), Math.cos(sy.angle), Math.sin(sy.angle)];
+    const pts = CUBE.map(([x, y, z]) => {
+      x *= 100; y *= 100; z *= 100;
+      [y, z] = [y * ca - z * sa, y * sa + z * ca];
+      [x, z] = [x * cb + z * sb, -x * sb + z * cb];
+      return [120 + x / (z + 250) * 150, 120 - y / (z + 250) * 150];
+    });
+    p.stroke(255, 100);
+    for (const [a, b] of EDGES) p.line(pts[a][0], pts[a][1], pts[b][0], pts[b][1]);
+  }
 
+  p.setup = () => {
+    p.pixelDensity(1);
+    p.createCanvas(SIZE, SIZE);
+    image = p.createImage(SIZE, SIZE);
+    p.textSize(12);
+  };
 
+  p.draw = () => {
+    const dt = Math.min(0.05, p.deltaTime / 1000);
+    if (st.rev !== builtRev || st.variant !== builtVariant) rebuild();
 
+    if (st.playing && project.duration > 0) st.time = (st.time + p.deltaTime) % project.duration;
 
+    let rateX = 0, rateY = 0;
+    if (dragging) {
+      rateY = (p.mouseX - lastX) / Math.max(dt, 0.001) * 0.012;
+      rateX = (p.mouseY - lastY) / Math.max(dt, 0.001) * 0.012;
+      lastX = p.mouseX;
+      lastY = p.mouseY;
+    }
+    springStep(sx, rateX, dt);
+    springStep(sy, rateY, dt);
 
+    if (player && !compileState.result.errors.length) {
+      player.render(Math.round(st.time), Math.round(sx.angle * TO_UNITS), Math.round(sy.angle * TO_UNITS), 0);
+      blit();
+    } else {
+      p.background(0);
+    }
 
+    const ctx = p.drawingContext;
+    ctx.fillStyle = "#000";
+    ctx.beginPath();
+    ctx.rect(0, 0, SIZE, SIZE);
+    ctx.arc(120, 120, 120, 0, Math.PI * 2, true);
+    ctx.fill("evenodd");
 
+    if (dragging) drawCube();
+  };
 
-
-
-
-
-
-
-
-
+  p.mousePressed = () => {
+    if (p.mouseX >= 0 && p.mouseX < SIZE && p.mouseY >= 0 && p.mouseY < SIZE) {
+      dragging = true;
+      lastX = p.mouseX;
+      lastY = p.mouseY;
+    }
+  };
+  p.mouseReleased = () => { dragging = false; };
+}
