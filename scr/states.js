@@ -1,45 +1,48 @@
-// The project file plus the editor state around it. Times are ms, x/y are pixels
-// from the display centre with y up, z is depth. z = -100 draws at 1:1 scale.
+// Application state: the open project, what is selected, the playhead, undo/redo.
+// Panels read `project` and `programState` every frame and call commit() after an edit.
 
-import { LINEAR, sampleShape, segmentAt } from "./functions.js";
-
-export const DEFAULT_Z = -100;
-let nextId = 1;
-const uid = () => nextId++;
-
-export function makeKey(t, pts, z = DEFAULT_Z) {
-  return { id: uid(), t, z, pts: pts.map((p) => ({ x: p.x, y: p.y, c: p.c ? [...p.c] : [...LINEAR] })) };
-}
-
-function demoProject() {
-  const ring = (cx, rx, ry) => Array.from({ length: 60 }, (_, i) => {
-    const a = 2 * Math.PI * i / 60;
-    return { x: cx + rx * Math.cos(a), y: ry * Math.sin(a), c: [0.6, 0.06, 0.98, 0.54] };
-  });
-  return {
-    version: 1, name: "Untitled", duration: 5000,
-    variants: [{ name: "Default", colors: ["#000000", "#9C4D00", "#FFD23F", "#3DA5D9"] }],
-    shapes: [{
-      id: uid(), name: "Shape 1", start: 0, end: 5000,
-      colorKeys: [{ t: 0, slot: 1 }],
-      keys: [makeKey(1000, ring(-45, 22, 18)), makeKey(4000, ring(45, 16, 28))],
-    }],
-  };
-}
+import { demoProject, syncIds, validateProject, setValue, evalTrack, uid } from "./model.js";
 
 export let project = demoProject();
 
-// Not saved. Selection keys look like "shapeId|keyId|point" and point -1 means all points.
+// Not saved with the project.
+// Key references are strings "layerId|propName|keyId|vertex"; vertex -1 means the whole key.
 export const programState = {
   time: 0, playing: true, tool: "select", rev: 0,
-  shapes: new Set(), points: new Set(), keys: new Set(),
-  variant: 0, onion: false, expanded: new Set(),
+  layers: new Set(),        // selected layer ids
+  vertices: new Set(),      // selected path vertices of the active layer
+  keys: new Set(),          // selected keyframes (key references)
+  expanded: new Set(),      // layers twirled open in the timeline
+  pathExpanded: new Set(),  // layers whose path shows one row per vertex
+  variant: 0, onion: false,
   spring: { k: 60, c: 5.4, gain: 1, max: 0.8 },
 };
+const st = programState;
 
 const listeners = [];
 export const onChange = (fn) => listeners.push(fn);
-export function refresh() { programState.rev++; listeners.forEach((fn) => fn()); }
+export function refresh() { st.rev++; listeners.forEach((fn) => fn()); }
+
+// ---------------------------------------------------------------- time
+
+export const frameMs = () => 1000 / project.fps;
+export const tolerance = () => 500 / project.fps; // half a frame: "on" a keyframe
+export const lastFrame = () => Math.max(0, Math.round(Math.ceil(project.duration / frameMs() - 1) * frameMs()));
+
+export function snapTime(t) {
+  const f = Math.round(t / frameMs());
+  return Math.max(0, Math.min(lastFrame(), Math.round(f * frameMs())));
+}
+
+export function setTime(t) {
+  st.time = snapTime(t);
+  st.playing = false;
+  refresh();
+}
+
+export const stepFrames = (n) => setTime(st.time + n * frameMs());
+
+// ---------------------------------------------------------------- undo
 
 let undoStack = [], redoStack = [], saved = JSON.stringify(project);
 
@@ -57,38 +60,17 @@ export function commit() {
 }
 
 function restore(json) {
-  project = JSON.parse(json);
-  saved = json;
-  nextId = 1 + Math.max(0, ...project.shapes.flatMap((s) => [s.id, ...s.keys.map((k) => k.id)]));
-  programState.shapes.clear(); programState.points.clear(); programState.keys.clear();
-  programState.variant = Math.min(programState.variant, project.variants.length - 1);
-  programState.time = Math.min(programState.time, project.duration);
+  project = validateProject(JSON.parse(json));
+  saved = JSON.stringify(project);
+  syncIds(project);
+  st.layers.clear(); st.vertices.clear(); st.keys.clear();
+  st.variant = Math.min(st.variant, project.variants.length - 1);
+  st.time = snapTime(st.time);
   refresh();
 }
 
 export function undo() { if (undoStack.length) { redoStack.push(saved); restore(undoStack.pop()); } }
 export function redo() { if (redoStack.length) { undoStack.push(saved); restore(redoStack.pop()); } }
-
-const isHex = (c) => typeof c === "string" && /^#[0-9a-f]{6}$/i.test(c);
-const isNum = (v) => typeof v === "number" && Number.isFinite(v);
-
-// Project files come from outside, so check everything the renderer would trust.
-export function validateProject(p) {
-  if (!p || p.version !== 1) throw new Error("Not an Epsilon project (version 1)");
-  if (!isNum(p.duration) || !Array.isArray(p.variants) || !p.variants.length || !Array.isArray(p.shapes)) throw new Error("Project is missing fields");
-  const slots = p.variants[0].colors?.length;
-  if (!p.variants.every((v) => v.colors?.length === slots && v.colors.every(isHex))) throw new Error("Bad colour variants");
-  for (const s of p.shapes) {
-    if (!isNum(s.id) || !isNum(s.start) || !isNum(s.end) || !s.keys?.length || !s.colorKeys?.length) throw new Error("Bad shape");
-    if (!s.colorKeys.every((c) => isNum(c.t) && c.slot >= 0 && c.slot < slots)) throw new Error("Bad colour key");
-    const n = s.keys[0].pts?.length;
-    for (const k of s.keys) {
-      if (!isNum(k.id) || !isNum(k.t) || !isNum(k.z) || k.pts?.length !== n) throw new Error("Bad keyframe");
-      if (!k.pts.every((q) => isNum(q.x) && isNum(q.y) && q.c?.length === 4 && q.c.every(isNum))) throw new Error("Bad point");
-    }
-  }
-  return p;
-}
 
 export function loadProject(text) {
   validateProject(JSON.parse(text));
@@ -100,92 +82,72 @@ export function loadProject(text) {
 export function newProject() {
   undoStack.push(saved);
   redoStack = [];
-  const p = demoProject();
-  p.shapes = [];
-  restore(JSON.stringify(p));
+  restore(JSON.stringify({ ...demoProject(), layers: [] }));
 }
 
-export const getShape = (id) => project.shapes.find((s) => s.id === id);
-export const activeShape = () => getShape([...programState.shapes].at(-1));
+// ---------------------------------------------------------------- selection
 
-export function addShape(pts, t, slot = 1) {
-  const s = {
-    id: uid(), name: `Shape ${project.shapes.length + 1}`, start: 0, end: project.duration,
-    colorKeys: [{ t: 0, slot: Math.min(slot, project.variants[0].colors.length - 1) }],
-    keys: [makeKey(t, pts)],
-  };
-  project.shapes.push(s);
-  select([s.id]);
-  return s;
-}
+export const getLayer = (id) => project.layers.find((l) => l.id === id);
+export const selectedLayers = () => [...st.layers].map(getLayer).filter(Boolean);
+export const activeLayer = () => getLayer([...st.layers].at(-1));
 
 export function select(ids) {
-  programState.shapes = new Set(ids);
-  programState.points.clear();
-  programState.keys.clear();
+  st.layers = new Set(ids);
+  st.vertices.clear();
+  st.keys.clear();
 }
 
-// Auto-key: the key at time t, created from the current pose if there is none.
-// shortcut: the new key copies the previous curve instead of splitting the bezier,
-// so timing shifts slightly around it; split the curve if artists notice.
-export function keyAt(shape, t) {
-  t = Math.round(t);
-  const found = shape.keys.find((k) => k.t === t);
-  if (found) return found;
-  const pose = sampleShape(shape, t), prev = shape.keys[segmentAt(shape.keys, t)];
-  const key = makeKey(t, pose.pts.map((p, i) => ({ ...p, c: prev.pts[i].c })), pose.z);
-  shape.keys.push(key);
-  shape.keys.sort((a, b) => a.t - b.t);
-  return key;
-}
-
-export function insertPoint(shape, index, f = 0.5) {
-  for (const k of shape.keys) {
-    const a = k.pts[index], b = k.pts[(index + 1) % k.pts.length];
-    k.pts.splice(index + 1, 0, { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f, c: [...a.c] });
-  }
-}
-
-export function removePoints(shape, indices) {
-  if (shape.keys[0].pts.length - indices.size < 3) return false;
-  for (const k of shape.keys) k.pts = k.pts.filter((_, i) => !indices.has(i));
-  return true;
-}
-
-export function deleteShapes(ids) {
-  project.shapes = project.shapes.filter((s) => !ids.has(s.id));
+export function deselectAll() {
   select([]);
+  refresh();
 }
 
-export function duplicateShapes(ids) {
-  const copies = project.shapes.filter((s) => ids.has(s.id)).map((s) => {
-    const c = JSON.parse(JSON.stringify(s));
+export const keyRef = (layerId, prop, keyId, vertex = -1) => `${layerId}|${prop}|${keyId}|${vertex}`;
+
+// Resolves key references to { layer, prop, track, key, vertex }, skipping stale ones.
+export function selectedKeys() {
+  const out = [];
+  for (const ref of st.keys) {
+    const [lid, prop, kid, vertex] = ref.split("|");
+    const layer = getLayer(Number(lid)), track = layer?.props[prop], key = track?.keys.find((k) => k.id === Number(kid));
+    if (key) out.push({ layer, prop, track, key, vertex: Number(vertex) });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- edits
+
+export function addLayer(layer) {
+  project.layers.push(layer);
+  select([layer.id]);
+}
+
+// Set a property at the playhead with the After Effects stopwatch rule (see model.setValue).
+export function setProp(layer, name, value) {
+  setValue(layer.props[name], value, st.time, tolerance());
+}
+
+export const propAt = (layer, name) => evalTrack(layer.props[name], st.time);
+
+export function duplicateLayers(ids) {
+  const copies = project.layers.filter((l) => ids.has(l.id)).map((l) => {
+    const c = JSON.parse(JSON.stringify(l));
     c.id = uid();
     c.name += " copy";
-    c.keys.forEach((k) => { k.id = uid(); k.pts.forEach((p) => { p.x += 8; p.y -= 8; }); });
+    for (const tr of Object.values(c.props)) for (const k of tr.keys) k.id = uid();
     return c;
   });
-  project.shapes.push(...copies);
+  project.layers.push(...copies);
   select(copies.map((c) => c.id));
 }
 
-export function moveShape(id, dir) {
-  const i = project.shapes.findIndex((s) => s.id === id), j = i + dir;
-  if (i < 0 || j < 0 || j >= project.shapes.length) return;
-  [project.shapes[i], project.shapes[j]] = [project.shapes[j], project.shapes[i]];
+export function deleteLayers(ids) {
+  project.layers = project.layers.filter((l) => !ids.has(l.id));
+  select([]);
 }
 
-export const selKey = (shapeId, keyId, point = -1) => `${shapeId}|${keyId}|${point}`;
-
-// Every point-and-key pair the selected keyframes cover. The last key has no outgoing
-// segment, so its curve is unused but setting it keeps the selection simple.
-export function selectedCurveTargets() {
-  const out = [];
-  for (const item of programState.keys) {
-    const [sid, kid, pt] = item.split("|").map(Number);
-    const key = getShape(sid)?.keys.find((k) => k.id === kid);
-    if (!key) continue;
-    if (pt >= 0) { if (key.pts[pt]) out.push(key.pts[pt]); } else out.push(...key.pts);
-  }
-  return out;
+export function moveLayer(id, dir) {
+  const i = project.layers.findIndex((l) => l.id === id), j = i + dir;
+  if (i < 0 || j < 0 || j >= project.layers.length) return;
+  [project.layers[i], project.layers[j]] = [project.layers[j], project.layers[i]];
 }

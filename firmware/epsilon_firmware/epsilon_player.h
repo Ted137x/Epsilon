@@ -1,15 +1,33 @@
-// Port of scr/player.js. Integer only: the ESP32-C6 has no FPU. No Arduino includes,
-// so tests/parity can build this on a PC and compare frames with the web emulator.
+// Epsilon player: plays EPS2 animation packs into a 240x240 RGB565 framebuffer.
+//
+// This is a line-for-line port of scr/player.js. Change both together;
+// tests/parity.test.mjs builds this file on a PC and checks every pixel matches.
+// It has no Arduino includes, so it compiles anywhere.
+//
+// Usage:
+//   eps::Player<true> player(EPS_PACK, framebuffer);  // true = byte-swapped RGB565 (LovyanGFX sprites)
+//   player.load(animationIndex, variantIndex);
+//   eps::Rect changed = player.render(timeMs, tiltX, tiltY, tiltZ);  // angles in 1/65536 turn
+//   // push only `changed` to the display
+//
+// Integer only: the ESP32-C6 has no FPU. Units: positions Q2 (quarter pixels),
+// screen coordinates Q4, trig and easing Q14, scale Q12 (4096 = 100%), rotation 0.1 deg.
 #pragma once
 #include <stdint.h>
-#include <string.h>
 
 namespace eps {
 
-constexpr int SIZE = 240;
-constexpr int FOV = 250;
-constexpr int SCALE = 150;
-constexpr uint32_t POOL_BYTES = 120 * 1024;  // keep in step with RAM_LIMIT in scr/compiler.js
+constexpr int SIZE = 240;              // display width and height
+constexpr int FOV = 250;               // perspective distance
+constexpr int SCALE = 150;             // projection scale
+constexpr int Z0 = -100;               // depth 0 sits here and projects at 1:1
+constexpr int MAX_POINTS = 1024;       // outline points per layer
+constexpr int MAX_VERTICES = 128;      // bezier path vertices per layer
+constexpr int ELLIPSE_POINTS = 32;
+constexpr uint32_t POOL_BYTES = 120 * 1024;  // keep equal to RAM_LIMIT in scr/compiler.js
+constexpr uint32_t MAGIC = 0x32535045;       // "EPS2"
+
+enum LayerType : uint8_t { ELLIPSE = 0, RECT = 1, PATH = 2 };
 
 static const int16_t SIN[257] = {
     0, 101, 201, 302, 402, 503, 603, 704, 804, 904, 1005, 1105, 1205, 1306, 1406, 1506,
@@ -31,7 +49,13 @@ static const int16_t SIN[257] = {
     16384,
 };
 
-// Angles are 1/65536 of a turn, results are Q14.
+// Cubic bezier weights for t = 0/8 .. 7/8, Q12.
+static const int16_t BEZ[8][4] = {
+    {4096, 0, 0, 0}, {2744, 1176, 168, 8}, {1728, 1728, 576, 64}, {1000, 1800, 1080, 216},
+    {512, 1536, 1536, 512}, {216, 1080, 1800, 1000}, {64, 576, 1728, 1728}, {8, 168, 1176, 2744},
+};
+
+// Angle in 1/65536 turn to sine, Q14.
 inline int32_t isin(int32_t a) {
   a &= 0xffff;
   const int q = a >> 14;
@@ -46,6 +70,7 @@ inline int32_t icos(int32_t a) { return isin(a + 0x4000); }
 inline int32_t mul(int32_t a, int32_t b) { return (a * b) >> 14; }
 inline int32_t imax(int32_t a, int32_t b) { return a > b ? a : b; }
 inline int32_t imin(int32_t a, int32_t b) { return a < b ? a : b; }
+inline int32_t clamp(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : v > hi ? hi : v; }
 
 // Pack data sits in flash at arbitrary offsets, so never cast to a wider pointer.
 inline uint16_t rd16(const uint8_t* p) { return uint16_t(p[0] | (p[1] << 8)); }
@@ -59,83 +84,75 @@ inline uint16_t lerp565(uint16_t a, uint16_t b, int32_t f) {
   return uint16_t((r << 11) | (g << 5) | l);
 }
 
+// Screen rectangle; x1 and y1 are exclusive.
 struct Rect {
-  int x0 = SIZE, y0 = SIZE, x1 = 0, y1 = 0;  // x1/y1 are exclusive
+  int x0 = SIZE, y0 = SIZE, x1 = 0, y1 = 0;
   bool empty() const { return x1 <= x0; }
+  int width() const { return x1 - x0; }
+  int height() const { return y1 - y0; }
 };
 
-struct Shape {
-  bool perPoint;
-  uint8_t nPts, nKeys, nColor;
-  uint16_t start, end;
-  const uint8_t* colors;  // flash: u16 time, u8 slot
-  const uint8_t* curve;   // flash
-  uint16_t* t;
-  int16_t* z;
-  int16_t* xy;
+// One animated property. n == 1 means a constant.
+struct Track {
+  uint8_t n = 0, dim = 0;
+  const uint16_t* t = nullptr;  // key times, RAM
+  const uint8_t* c = nullptr;   // curve index per segment, flash
+  const int16_t* v = nullptr;   // n * dim values, RAM
 };
 
-// swapBytes: LovyanGFX sprites hold RGB565 big-endian.
+// A bezier path: per vertex x, y, in-handle x, y, out-handle x, y.
+struct PathTrack {
+  uint8_t n = 0, nv = 0;
+  bool perVertex = false;       // one curve per vertex instead of one per segment
+  const uint16_t* t = nullptr;
+  const uint8_t* c = nullptr;
+  const int16_t* v = nullptr;   // n * nv * 6 values
+};
+
+struct Layer {
+  uint8_t type;
+  uint16_t in, out;             // visible while in <= t < out
+  Track anchor, position, scale, rotation, depth, fill, size;
+  PathTrack path;
+};
+
 template <bool swapBytes>
 class Player {
  public:
   Player(const uint8_t* pack, uint16_t* framebuffer) : pack_(pack), fb_(framebuffer) {}
 
-  bool valid() const { return rd32(pack_) == 0x31535045; }
-  int count() const { return rd16(pack_ + 4); }
-  int variants() const { return variants_; }
-  uint16_t duration() const { return duration_; }
+  bool valid() const { return rd32(pack_) == MAGIC; }
+  int count() const { return rd16(pack_ + 4); }      // animations in the pack
+  int variants() const { return variants_; }        // colour variants of the loaded animation
+  uint16_t duration() const { return duration_; }   // ms
+  int layerCount() const { return layerCount_; }
 
+  // Decodes an animation into RAM. Returns false if it does not fit POOL_BYTES.
   bool load(int index, int variant = 0) {
-    const uint8_t* o = pack_ + rd32(pack_ + 8 + index * 4);
+    o_ = pack_ + rd32(pack_ + 8 + index * 4);
     used_ = 0;
-    duration_ = rd16(o);
-    shapeCount_ = rd16(o + 2);
-    const int curveCount = o[4], slots = o[5];
-    variants_ = o[6];
-    o += 8;
-    curves_ = o;
-    o += curveCount * 66;
+    duration_ = rd16(o_);
+    layerCount_ = rd16(o_ + 2);
+    const int curveCount = o_[4], slots = o_[5];
+    variants_ = o_[6];
+    o_ += 8;
+    curves_ = o_;
+    o_ += curveCount * 66;
     if (variant >= variants_) variant = variants_ - 1;
-    palette_ = o + variant * slots * 2;
-    o += variants_ * slots * 2;
+    palette_ = o_ + variant * slots * 2;
+    o_ += variants_ * slots * 2;
 
-    shapes_ = static_cast<Shape*>(alloc(sizeof(Shape) * shapeCount_));
-    if (!shapes_) return false;
-    for (int s = 0; s < shapeCount_; s++) {
-      Shape& h = shapes_[s];
-      const uint8_t flags = o[0];
-      h.perPoint = flags & 1;
-      h.nPts = o[1]; h.nKeys = o[2]; h.nColor = o[3];
-      h.start = rd16(o + 4); h.end = rd16(o + 6);
-      o += 8;
-      h.colors = o;
-      o += h.nColor * 3;
-      h.t = static_cast<uint16_t*>(alloc(h.nKeys * 2));
-      h.z = static_cast<int16_t*>(alloc(h.nKeys * 2));
-      h.xy = static_cast<int16_t*>(alloc(h.nKeys * h.nPts * 4));
-      if (!h.t || !h.z || !h.xy) return false;
-      for (int i = 0; i < h.nKeys; i++, o += 2) h.t[i] = rd16(o);
-      for (int i = 0; i < h.nKeys; i++) {
-        h.z[i] = int16_t(rd16(o));
-        if (!(flags & 2)) o += 2;
-      }
-      if (flags & 2) o += 2;
-      h.curve = o;
-      o += (h.nKeys - 1) * (h.perPoint ? h.nPts : 1);
-
-      const int n = h.nPts * 2;
-      for (int i = 0; i < n; i++, o += 2) h.xy[i] = int16_t(rd16(o));
-      for (int k = 1; k < h.nKeys; k++) {
-        const uint8_t mode = *o++;
-        int16_t* cur = h.xy + k * n;
-        for (int i = 0; i < n; i++) {
-          int32_t d = 0;
-          if (mode == 1) d = int8_t(*o++);
-          else if (mode == 2) { d = int16_t(rd16(o)); o += 2; }
-          cur[i] = int16_t(cur[i - n] + d);
-        }
-      }
+    layers_ = static_cast<Layer*>(alloc(sizeof(Layer) * layerCount_));
+    if (!layers_) return false;
+    for (int i = 0; i < layerCount_; i++) {
+      Layer& l = layers_[i];
+      l.type = o_[0];
+      l.in = rd16(o_ + 2);
+      l.out = rd16(o_ + 4);
+      o_ += 6;
+      if (!readTrack(l.anchor, 2) || !readTrack(l.position, 2) || !readTrack(l.scale, 2) ||
+          !readTrack(l.rotation, 1) || !readTrack(l.depth, 1) || !readTrack(l.fill, 1)) return false;
+      if (l.type == PATH ? !readPath(l.path) : !readTrack(l.size, 2)) return false;
     }
     const uint16_t bg = pixel(paletteAt(0));
     for (int i = 0; i < SIZE * SIZE; i++) fb_[i] = bg;
@@ -143,10 +160,10 @@ class Player {
     return true;
   }
 
-  // The next frame clears and repaints the whole screen (used by the debug overlay).
+  // The next render clears and repaints the whole screen.
   void invalidate() { dirty_.x0 = 0; dirty_.y0 = 0; dirty_.x1 = SIZE; dirty_.y1 = SIZE; }
 
-  // Draws the frame and returns the rectangle that changed.
+  // Draws frame t (ms) tilted by the given angles (1/65536 turn). Returns the changed area.
   Rect render(uint32_t t, int32_t ax, int32_t ay, int32_t az) {
     const int32_t sa = isin(ax), ca = icos(ax), sb = isin(ay), cb = icos(ay), sc = isin(az), cc = icos(az);
     const int32_t sasb = mul(sa, sb), casb = mul(ca, sb);
@@ -162,28 +179,29 @@ class Player {
     }
 
     Rect box;
-    for (int s = 0; s < shapeCount_; s++) {
-      const Shape& h = shapes_[s];
-      if (t < h.start || t >= h.end) continue;
-      int k = 0;
-      while (k < h.nKeys - 1 && t >= h.t[k + 1]) k++;
-      const bool moving = k < h.nKeys - 1 && t > h.t[k];
-      const int32_t frac = moving ? int32_t(((t - h.t[k]) << 10) / uint32_t(h.t[k + 1] - h.t[k])) : 0;
-      const int16_t* a = h.xy + k * h.nPts * 2;
-      const int16_t* b = a + h.nPts * 2;
-      int32_t z = int32_t(h.z[k]) * 4;
-      if (moving) z += ((int32_t(h.z[k + 1]) - h.z[k]) * 4 * ease(h.curve[h.perPoint ? k * h.nPts : k], frac)) >> 14;
+    int32_t anchor[2], pos[2], scale[2], rot[1], depth[1];
+    for (int li = 0; li < layerCount_; li++) {
+      const Layer& l = layers_[li];
+      if (t < l.in || t >= l.out) continue;
+      value(l.anchor, t, anchor);
+      value(l.position, t, pos);
+      value(l.scale, t, scale);
+      value(l.rotation, t, rot);
+      value(l.depth, t, depth);
+      const int32_t turn = -((rot[0] * 4096) / 225);  // tenths of a degree to 1/65536 turn
+      const int32_t cr = icos(turn), sr = isin(turn);
+      const int32_t z = (depth[0] + Z0) * 4;
 
-      for (int i = 0; i < h.nPts; i++) {
-        int32_t x = a[i * 2], y = a[i * 2 + 1];
-        if (moving) {
-          const int32_t e = ease(h.curve[h.perPoint ? k * h.nPts + i : k], frac);
-          x += ((b[i * 2] - x) * e) >> 14;
-          y += ((b[i * 2 + 1] - y) * e) >> 14;
-        }
+      const int n = outline(l, t);
+      for (int i = 0; i < n; i++) {
+        // Clamps keep every product inside 32 bits.
+        const int32_t dx = clamp(lx_[i] - anchor[0], -16383, 16383), dy = clamp(ly_[i] - anchor[1], -16383, 16383);
+        const int32_t xs = clamp((dx * scale[0]) >> 12, -32767, 32767), ys = clamp((dy * scale[1]) >> 12, -32767, 32767);
+        const int32_t x = clamp(((xs * cr - ys * sr) >> 14) + pos[0], -8000, 8000);
+        const int32_t y = clamp(((xs * sr + ys * cr) >> 14) + pos[1], -8000, 8000);
         project(x, y, z, sx_[i], sy_[i]);
       }
-      fill(h.nPts, pixel(shapeColor(h, t)), box);
+      fill(n, pixel(color(l.fill, t)), box);
     }
 
     dirty_ = box;
@@ -195,16 +213,18 @@ class Player {
     return r;
   }
 
-  // Q2 model coordinates to Q4 screen coordinates, using the last render's rotation.
+  // Q2 world point to Q4 screen point, using the last render's tilt. Handy for overlays.
   void project(int32_t x, int32_t y, int32_t z, int32_t& outX, int32_t& outY) const {
     const int32_t X = (m_[0] * x + m_[1] * y + m_[2] * z) >> 14;
     const int32_t Y = (m_[3] * x + m_[4] * y + m_[5] * z) >> 14;
     const int32_t w = imax(16, ((m_[6] * x + m_[7] * y + m_[8] * z) >> 14) + (FOV << 2));
-    outX = imax(-8192, imin(8192, 1920 + (X * SCALE * 16) / w));
-    outY = imax(-8192, imin(8192, 1920 - (Y * SCALE * 16) / w));
+    outX = clamp(1920 + (X * SCALE * 16) / w, -8192, 8192);
+    outY = clamp(1920 - (Y * SCALE * 16) / w, -8192, 8192);
   }
 
  private:
+  // ---------------------------------------------------------- loading
+
   void* alloc(uint32_t bytes) {
     bytes = (bytes + 3) & ~3u;
     if (used_ + bytes > POOL_BYTES) return nullptr;
@@ -212,6 +232,56 @@ class Player {
     used_ += bytes;
     return p;
   }
+
+  const int16_t* readValues(int count, int n) {
+    int16_t* v = static_cast<int16_t*>(alloc(uint32_t(count) * n * 2));
+    if (!v) return nullptr;
+    for (int i = 0; i < count; i++, o_ += 2) v[i] = int16_t(rd16(o_));
+    for (int k = 1; k < n; k++) {
+      const uint8_t mode = *o_++;
+      int16_t* cur = v + k * count;
+      for (int i = 0; i < count; i++) {
+        if (mode == 0) cur[i] = cur[i - count];
+        else if (mode == 1) cur[i] = int16_t(cur[i - count] + int8_t(*o_++));
+        else { cur[i] = int16_t(rd16(o_)); o_ += 2; }
+      }
+    }
+    return v;
+  }
+
+  const uint16_t* readTimes(int n) {
+    uint16_t* t = static_cast<uint16_t*>(alloc(n * 2));
+    if (!t) return nullptr;
+    for (int i = 0; i < n; i++, o_ += 2) t[i] = rd16(o_);
+    return t;
+  }
+
+  bool readTrack(Track& tr, int dim) {
+    tr.n = *o_++;
+    tr.dim = dim;
+    if (tr.n > 1) {
+      if (!(tr.t = readTimes(tr.n))) return false;
+      tr.c = o_;
+      o_ += tr.n - 1;
+    }
+    return (tr.v = readValues(dim, tr.n)) != nullptr;
+  }
+
+  bool readPath(PathTrack& tr) {
+    tr.nv = o_[0];
+    tr.n = o_[1];
+    tr.perVertex = o_[2] & 1;
+    o_ += 3;
+    if (tr.nv > MAX_VERTICES) return false;
+    if (tr.n > 1) {
+      if (!(tr.t = readTimes(tr.n))) return false;
+      tr.c = o_;
+      o_ += (tr.n - 1) * (tr.perVertex ? tr.nv : 1);
+    }
+    return (tr.v = readValues(tr.nv * 6, tr.n)) != nullptr;
+  }
+
+  // ---------------------------------------------------------- evaluation
 
   static uint16_t pixel(uint16_t c) { return swapBytes ? uint16_t((c << 8) | (c >> 8)) : c; }
   uint16_t paletteAt(int slot) const { return rd16(palette_ + slot * 2); }
@@ -224,18 +294,92 @@ class Player {
     return a + (((b - a) * (frac & 31)) >> 5);
   }
 
-  uint16_t shapeColor(const Shape& h, uint32_t t) const {
-    int k = 0;
-    while (k < h.nColor - 1 && t >= rd16(h.colors + (k + 1) * 3)) k++;
-    const uint8_t* c = h.colors + k * 3;
-    const uint16_t a = paletteAt(c[2]);
-    const uint32_t t0 = rd16(c);
-    if (k == h.nColor - 1 || t <= t0) return a;
-    const uint32_t t1 = rd16(c + 3);
-    return lerp565(a, paletteAt(c[5]), int32_t(((t - t0) << 10) / (t1 - t0)));
+  // Finds the key segment for t. frac (Q10) is -1 when holding key k.
+  void locate(uint8_t n, const uint16_t* times, uint32_t t, int& k, int32_t& frac) const {
+    k = 0;
+    while (k < n - 1 && t >= times[k + 1]) k++;
+    frac = k < n - 1 && t > times[k] ? int32_t(((t - times[k]) << 10) / uint32_t(times[k + 1] - times[k])) : -1;
   }
 
-  // Scanline even-odd fill, sampled at pixel centres.
+  void value(const Track& tr, uint32_t t, int32_t* out) const {
+    if (tr.n == 1) { for (int i = 0; i < tr.dim; i++) out[i] = tr.v[i]; return; }
+    int k; int32_t frac;
+    locate(tr.n, tr.t, t, k, frac);
+    const int16_t* a = tr.v + k * tr.dim;
+    if (frac < 0) { for (int i = 0; i < tr.dim; i++) out[i] = a[i]; return; }
+    const int32_t e = ease(tr.c[k], frac);
+    const int16_t* b = a + tr.dim;
+    for (int i = 0; i < tr.dim; i++) out[i] = a[i] + (((b[i] - a[i]) * e) >> 14);
+  }
+
+  uint16_t color(const Track& tr, uint32_t t) const {
+    if (tr.n == 1) return paletteAt(tr.v[0]);
+    int k; int32_t frac;
+    locate(tr.n, tr.t, t, k, frac);
+    const uint16_t a = paletteAt(tr.v[k]);
+    if (frac < 0) return a;
+    const int32_t e = ease(tr.c[k], frac);
+    return lerp565(a, paletteAt(tr.v[k + 1]), clamp(e >> 4, 0, 1024));
+  }
+
+  void pathValues(const PathTrack& tr, uint32_t t) {
+    const int count = tr.nv * 6;
+    if (tr.n == 1) { for (int i = 0; i < count; i++) vtx_[i] = tr.v[i]; return; }
+    int k; int32_t frac;
+    locate(tr.n, tr.t, t, k, frac);
+    const int16_t* a = tr.v + k * count;
+    if (frac < 0) { for (int i = 0; i < count; i++) vtx_[i] = a[i]; return; }
+    const int16_t* b = a + count;
+    int32_t e = 0;
+    for (int i = 0; i < count; i++) {
+      if (i % 6 == 0 && (i == 0 || tr.perVertex)) e = ease(tr.c[tr.perVertex ? k * tr.nv + i / 6 : k], frac);
+      vtx_[i] = a[i] + (((b[i] - a[i]) * e) >> 14);
+    }
+  }
+
+  // Layer outline in layer space (Q2) into lx_/ly_. Returns the point count.
+  int outline(const Layer& l, uint32_t t) {
+    if (l.type != PATH) {
+      int32_t s[2];
+      value(l.size, t, s);
+      const int32_t rx = s[0] >> 1, ry = s[1] >> 1;
+      if (l.type == RECT) {
+        lx_[0] = -rx; ly_[0] = -ry; lx_[1] = rx; ly_[1] = -ry;
+        lx_[2] = rx; ly_[2] = ry; lx_[3] = -rx; ly_[3] = ry;
+        return 4;
+      }
+      for (int i = 0; i < ELLIPSE_POINTS; i++) {
+        lx_[i] = (rx * icos(i * (65536 / ELLIPSE_POINTS))) >> 14;
+        ly_[i] = (ry * isin(i * (65536 / ELLIPSE_POINTS))) >> 14;
+      }
+      return ELLIPSE_POINTS;
+    }
+
+    pathValues(l.path, t);
+    const int nv = l.path.nv;
+    int n = 0;
+    for (int i = 0; i < nv; i++) {
+      const int32_t* a = vtx_ + i * 6;
+      const int32_t* b = vtx_ + ((i + 1) % nv) * 6;
+      if (a[4] == 0 && a[5] == 0 && b[2] == 0 && b[3] == 0) {
+        lx_[n] = a[0]; ly_[n] = a[1]; n++;
+        continue;
+      }
+      const int32_t x0 = a[0], y0 = a[1], x3 = b[0], y3 = b[1];
+      const int32_t x1 = x0 + a[4], y1 = y0 + a[5], x2 = x3 + b[2], y2 = y3 + b[3];
+      for (int k = 0; k < 8; k++) {
+        const int16_t* w = BEZ[k];
+        lx_[n] = (w[0] * x0 + w[1] * x1 + w[2] * x2 + w[3] * x3) >> 12;
+        ly_[n] = (w[0] * y0 + w[1] * y1 + w[2] * y2 + w[3] * y3) >> 12;
+        n++;
+      }
+    }
+    return n;
+  }
+
+  // ---------------------------------------------------------- drawing
+
+  // Scanline even-odd fill sampled at pixel centres.
   void fill(int n, uint16_t color, Rect& box) {
     int32_t top = 1 << 30, bottom = -(1 << 30);
     for (int i = 0; i < n; i++) {
@@ -269,14 +413,16 @@ class Player {
 
   const uint8_t* pack_;
   uint16_t* fb_;
+  const uint8_t* o_ = nullptr;  // read cursor while loading
   const uint8_t* curves_ = nullptr;
   const uint8_t* palette_ = nullptr;
-  Shape* shapes_ = nullptr;
-  uint16_t duration_ = 0, shapeCount_ = 0;
+  Layer* layers_ = nullptr;
+  uint16_t duration_ = 0, layerCount_ = 0;
   int variants_ = 0;
   Rect dirty_;
   int32_t m_[9] = {16384, 0, 0, 0, 16384, 0, 0, 0, 16384};
-  int32_t sx_[256], sy_[256], nodes_[256];
+  int32_t lx_[MAX_POINTS], ly_[MAX_POINTS], sx_[MAX_POINTS], sy_[MAX_POINTS], nodes_[MAX_POINTS];
+  int32_t vtx_[MAX_VERTICES * 6];
   uint32_t used_ = 0;
   alignas(4) uint8_t pool_[POOL_BYTES];
 };

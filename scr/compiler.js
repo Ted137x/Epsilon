@@ -1,26 +1,56 @@
-// Turns project JSON into the compact binary the firmware plays straight from flash.
-// Runs in the browser and in Node (tools/epsc.mjs). Layout: docs/FORMAT.md.
+// Turns a project into the compact EPS2 binary that the firmware plays straight from
+// flash. Runs in the browser (Export) and in Node (tools/epsc.mjs).
+// The byte layout is documented in DEVELOPER.md; scr/player.js and
+// firmware/epsilon_firmware/epsilon_player.h read it.
 
 import { easeAt, hexTo565 } from "./functions.js";
+import { propsOf } from "./model.js";
+
+export const MAGIC = 0x32535045; // "EPS2"
+export const RAM_LIMIT = 120 * 1024; // POOL_BYTES in epsilon_player.h
+export const MAX_PATH_VERTICES = 128; // 8 points per curved segment, 1024 points max
+export const TYPES = { ellipse: 0, rect: 1, path: 2 };
 
 class Writer {
   constructor() { this.b = []; }
   u8(v) { this.b.push(v & 255); }
-  i8(v) { this.u8(v); }
   u16(v) { this.b.push(v & 255, (v >> 8) & 255); }
   i16(v) { this.u16(v); }
   u32(v) { this.u16(v & 0xffff); this.u16(v >>> 16); }
 }
 
-export const RAM_LIMIT = 120 * 1024; // POOL_BYTES in epsilon_player.h
-const q2 = (v) => Math.max(-4000, Math.min(4000, Math.round(v * 4)));
+const i16 = (v) => Math.max(-32768, Math.min(32767, Math.round(v)));
+
+// Editor units to the integers the player uses.
+const ENCODE = {
+  anchor: (v) => v.map((x) => i16(x * 4)),          // quarter pixels
+  position: (v) => v.map((x) => i16(x * 4)),
+  size: (v) => v.map((x) => i16(Math.abs(x) * 4)),
+  scale: (v) => v.map((x) => i16(x * 4096 / 100)),   // 4096 = 100 %
+  rotation: (v) => [i16(v[0] * 10)],                 // tenths of a degree
+  depth: (v) => [Math.max(-1000, Math.min(1000, Math.round(v[0])))],
+  fill: (v) => [Math.round(v[0])],
+  path: (v) => v.flatMap((q) => [q.x, q.y, q.ix, q.iy, q.ox, q.oy].map((x) => i16(x * 4))),
+};
+
+// Values of every key: the first in full, later ones as small deltas when they fit.
+function writeValues(w, rows) {
+  rows[0].forEach((v) => w.i16(v));
+  for (let k = 1; k < rows.length; k++) {
+    const d = rows[k].map((v, i) => v - rows[k - 1][i]);
+    const mode = d.every((v) => v === 0) ? 0 : d.every((v) => v >= -128 && v <= 127) ? 1 : 2;
+    w.u8(mode);
+    if (mode === 1) d.forEach((v) => w.u8(v));
+    if (mode === 2) rows[k].forEach((v) => w.i16(v));
+  }
+}
 
 export function compile(project) {
   const errors = [];
-  if (project.duration < 1 || project.duration > 60000) errors.push("Duration must be 1..60000 ms");
-  if (!project.variants.length) errors.push("At least one colour variant is required");
+  if (!(project.duration >= 1 && project.duration <= 60000)) errors.push("Length must be 1..60000 ms");
   const slots = project.variants[0]?.colors.length ?? 0;
   if (slots < 1 || slots > 255) errors.push("Palette must have 1..255 colours");
+  if (project.layers.length > 1000) errors.push("Too many layers");
 
   const curves = new Map();
   const curveId = (c) => {
@@ -31,49 +61,57 @@ export function compile(project) {
 
   const body = new Writer();
   let ram = 0;
-  for (const s of project.shapes) {
-    ram += 48 + s.keys.length * (4 + s.keys[0].pts.length * 4);
-    const n = s.keys[0].pts.length, keys = [...s.keys].sort((a, b) => a.t - b.t);
-    if (n < 3 || n > 255) errors.push(`${s.name}: needs 3..255 points`);
-    if (keys.length > 255) errors.push(`${s.name}: too many keyframes`);
-    if (keys.some((k) => k.pts.length !== n)) errors.push(`${s.name}: keyframes disagree on point count`);
-    if (errors.length) continue;
+  const alloc = (bytes) => { ram += (bytes + 3) & ~3; };
 
-    const segs = keys.slice(0, -1).map((k) => k.pts.map((p) => curveId(p.c)));
-    const perPoint = segs.some((seg) => seg.some((id) => id !== seg[0]));
-    const constZ = keys.every((k) => k.z === keys[0].z);
-    const colors = [...s.colorKeys].sort((a, b) => a.t - b.t);
+  for (const layer of project.layers) {
+    alloc(256);
+    body.u8(TYPES[layer.type]);
+    body.u8(0);
+    body.u16(Math.max(0, Math.min(project.duration, Math.round(layer.in))));
+    body.u16(Math.max(0, Math.min(project.duration, Math.round(layer.out))));
 
-    body.u8((perPoint ? 1 : 0) | (constZ ? 2 : 0));
-    body.u8(n); body.u8(keys.length); body.u8(colors.length);
-    body.u16(s.start); body.u16(Math.min(s.end, project.duration));
-    for (const c of colors) { body.u16(c.t); body.u8(c.slot); }
-    for (const k of keys) body.u16(k.t);
-    for (const k of constZ ? keys.slice(0, 1) : keys) body.i16(Math.max(-1000, Math.min(1000, Math.round(k.z))));
-    for (const seg of segs) for (const id of perPoint ? seg : seg.slice(0, 1)) body.u8(id);
+    for (const name of ["anchor", "position", "scale", "rotation", "depth", "fill", propsOf(layer)[0]]) {
+      const tr = layer.props[name], keys = [...tr.keys].sort((a, b) => a.t - b.t);
+      if (keys.length > 255) { errors.push(`${layer.name}: ${name} has more than 255 keyframes`); continue; }
+      const rows = (keys.length ? keys.map((k) => k.v) : [tr.value]).map(ENCODE[name]);
+      if (name === "fill" && rows.some((r) => r[0] < 0 || r[0] >= slots)) errors.push(`${layer.name}: fill uses a missing colour`);
+      const n = rows.length;
 
-    let prev = keys[0].pts.flatMap((p) => [q2(p.x), q2(p.y)]);
-    prev.forEach((v) => body.i16(v));
-    for (const k of keys.slice(1)) {
-      const cur = k.pts.flatMap((p) => [q2(p.x), q2(p.y)]);
-      const d = cur.map((v, i) => v - prev[i]);
-      const mode = d.every((v) => v === 0) ? 0 : d.every((v) => v >= -128 && v <= 127) ? 1 : 2;
-      body.u8(mode);
-      if (mode === 1) d.forEach((v) => body.i8(v));
-      if (mode === 2) d.forEach((v) => body.i16(v));
-      prev = cur;
+      if (name === "path") {
+        const nv = tr.value.length;
+        if (nv < 3 || nv > MAX_PATH_VERTICES) { errors.push(`${layer.name}: a path needs 3..${MAX_PATH_VERTICES} points`); continue; }
+        if (keys.some((k) => k.v.length !== nv)) { errors.push(`${layer.name}: path keyframes disagree on point count`); continue; }
+        const segs = keys.slice(0, -1).map((k) => k.v.map((_, i) => curveId(k.vc?.[i] ?? k.c)));
+        const perVertex = segs.some((s) => s.some((id) => id !== s[0]));
+        body.u8(nv); body.u8(n); body.u8(perVertex ? 1 : 0);
+        if (n > 1) {
+          keys.forEach((k) => body.u16(Math.round(k.t)));
+          segs.forEach((s) => (perVertex ? s : s.slice(0, 1)).forEach((id) => body.u8(id)));
+        }
+        writeValues(body, rows);
+        alloc(n * 2); alloc(n * nv * 12);
+      } else {
+        body.u8(n);
+        if (n > 1) {
+          keys.forEach((k) => body.u16(Math.round(k.t)));
+          keys.slice(0, -1).forEach((k) => body.u8(curveId(k.c)));
+        }
+        writeValues(body, rows);
+        alloc(n * 2); alloc(n * rows[0].length * 2);
+      }
     }
   }
+
   if (curves.size > 255) errors.push("More than 255 different curves");
-  if (ram > RAM_LIMIT) errors.push(`Needs ${ram} bytes of RAM, the player has ${RAM_LIMIT}`);
+  if (ram > RAM_LIMIT) errors.push(`Needs ${ram} bytes of player RAM, the limit is ${RAM_LIMIT}`);
   if (errors.length) return { errors };
 
   const out = new Writer();
-  out.u16(project.duration);
-  out.u16(project.shapes.length);
-  out.u8(curves.size); out.u8(slots); out.u8(project.variants.length); out.u8(0);
+  out.u16(Math.round(project.duration));
+  out.u16(project.layers.length);
+  out.u8(curves.size); out.u8(slots); out.u8(project.variants.length); out.u8(Math.min(255, project.fps));
   for (const { c } of curves.values()) {
-    for (let i = 0; i <= 32; i++) out.i16(Math.max(-32768, Math.min(32767, Math.round(easeAt(c, i / 32) * 16384))));
+    for (let i = 0; i <= 32; i++) out.i16(Math.max(-24576, Math.min(24576, Math.round(easeAt(c, i / 32) * 16384))));
   }
   for (const v of project.variants) for (const hex of v.colors) out.u16(hexTo565(hex));
   return { errors, ram, bytes: Uint8Array.from([...out.b, ...body.b]) };
@@ -81,7 +119,7 @@ export function compile(project) {
 
 export function pack(animations) {
   const head = new Writer();
-  head.u32(0x31535045); // "EPS1"
+  head.u32(MAGIC);
   head.u16(animations.length); head.u16(0);
   let offset = 8 + animations.length * 4;
   for (const a of animations) { head.u32(offset); offset += a.length; }
@@ -95,7 +133,7 @@ export function pack(animations) {
 export function toHeader(bytes) {
   const lines = [];
   for (let i = 0; i < bytes.length; i += 24) lines.push("  " + Array.from(bytes.subarray(i, i + 24)).join(",") + ",");
-  return `// Generated by Epsilon. Do not edit.\n#pragma once\n#include <stdint.h>\n\n` +
+  return `// Generated by Epsilon (tools/epsc.mjs or Export .h). Do not edit by hand.\n#pragma once\n#include <stdint.h>\n\n` +
     `static const uint32_t EPS_PACK_SIZE = ${bytes.length};\n` +
     `static const uint8_t EPS_PACK[] __attribute__((aligned(4))) = {\n${lines.join("\n")}\n};\n`;
 }

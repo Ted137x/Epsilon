@@ -1,5 +1,8 @@
-import { project, programState as st, commit, onChange, activeShape, keyAt, moveShape, refresh } from "./states.js";
-import { colorSlotAt, sampleShape } from "./functions.js";
+// The Inspector panel: numeric fields for the selected layer's properties at the
+// playhead, plus project settings and colour variants when nothing is selected.
+
+import { project, programState as st, commit, refresh, onChange, activeLayer, setProp, propAt, moveLayer, frameMs } from "./states.js";
+import { PROPS, propsOf, convertToPath } from "./model.js";
 
 const host = document.getElementById("inspector");
 
@@ -9,59 +12,54 @@ function el(tag, props = {}, ...kids) {
   return node;
 }
 
-function field(label, control) {
-  return el("label", { className: "field" }, el("span", { textContent: label }), control);
+const field = (label, ...controls) => el("label", { className: "field" }, el("span", { textContent: label }), el("span", { className: "inputs" }, ...controls));
+
+function number(value, onSet, attrs = {}) {
+  return el("input", {
+    type: "number", step: "any", value: Math.round(value * 100) / 100, ...attrs,
+    onchange: (e) => {
+      const v = Number(e.target.value);
+      if (Number.isFinite(v)) { onSet(v); commit(); }
+    },
+  });
 }
 
-const number = (value, onSet, attrs = {}) => el("input", {
-  type: "number", value: Math.round(value), ...attrs,
-  onchange: (e) => { const v = Number(e.target.value); if (Number.isFinite(v)) { onSet(v); commit(); } },
-});
+function propField(l, name) {
+  const info = PROPS[name], v = propAt(l, name), animated = l.props[name].keys.length > 0;
+  const label = `${info.label}${info.unit && info.unit !== "px" ? ` (${info.unit})` : ""}${animated ? " ◆" : ""}`;
+  return field(label, ...v.map((x, i) => number(x, (nv) => {
+    const next = [...propAt(l, name)];
+    next[i] = nv;
+    setProp(l, name, next);
+  })));
+}
 
-const clampTime = (v) => Math.max(0, Math.min(project.duration, Math.round(v)));
-
-function shapePanel(s) {
-  const slots = project.variants[st.variant].colors;
-  const slot = colorSlotAt(s, st.time), t = Math.round(st.time);
-
-  const colorSelect = el("select", {
-    onchange: (e) => {
-      const value = Number(e.target.value), key = s.colorKeys.find((c) => c.t === t);
-      if (key) key.slot = value;
-      else if (s.colorKeys.length === 1) s.colorKeys[0].slot = value;
-      else { s.colorKeys.push({ t, slot: value }); s.colorKeys.sort((a, b) => a.t - b.t); }
-      commit();
-    },
-  }, ...slots.map((c, i) => el("option", { value: i, textContent: `${i === 0 ? "Bg" : `Colour ${i}`} ${c}`, selected: i === slot })));
+function layerPanel(l) {
+  const colors = project.variants[st.variant].colors, slot = propAt(l, "fill")[0];
+  const fill = el("select", { onchange: (e) => { setProp(l, "fill", [Number(e.target.value)]); commit(); } },
+    ...colors.map((c, i) => el("option", { value: i, textContent: `${i === 0 ? "Background" : `Colour ${i}`} ${c}`, selected: i === slot })));
+  const time = (v) => `${v} ms (frame ${Math.round(v / frameMs())})`;
 
   return [
-    el("h3", { textContent: "Shape" }),
-    field("Name", el("input", { value: s.name, onchange: (e) => { s.name = e.target.value; commit(); } })),
-    field("Colour", colorSelect),
+    el("h3", { textContent: `${l.type === "path" ? "Path" : l.type === "rect" ? "Rectangle" : "Ellipse"} layer` }),
+    field("Name", el("input", { value: l.name, onchange: (e) => { l.name = e.target.value; commit(); } })),
+    field(`Fill${l.props.fill.keys.length ? " ◆" : ""}`, fill),
+    ...propsOf(l).filter((n) => n !== "fill" && n !== "path").map((n) => propField(l, n)),
+    field("In", number(l.in, (v) => { l.in = Math.max(0, Math.min(l.out - 1, Math.round(v))); }, { title: time(l.in) })),
+    field("Out", number(l.out, (v) => { l.out = Math.min(project.duration, Math.max(l.in + 1, Math.round(v))); }, { title: time(l.out) })),
     el("div", { className: "row" },
-      el("button", {
-        textContent: "Add colour key",
-        title: "Blend to a new colour from the playhead",
-        onclick: () => {
-          if (!s.colorKeys.some((c) => c.t === t)) {
-            s.colorKeys.push({ t, slot });
-            s.colorKeys.sort((a, b) => a.t - b.t);
-            commit();
-          }
-        },
-      }),
-      el("button", {
-        textContent: "Clear",
-        title: "Back to one colour",
-        onclick: () => { s.colorKeys = [{ t: 0, slot }]; commit(); },
+      el("button", { textContent: "Bring forward", onclick: () => { moveLayer(l.id, 1); commit(); } }),
+      el("button", { textContent: "Send back", onclick: () => { moveLayer(l.id, -1); commit(); } }),
+      l.type === "path" ? "" : el("button", {
+        textContent: "Convert to path", title: "Turn into an editable bezier path",
+        onclick: () => { convertToPath(l); commit(); },
       })),
-    field("Depth", number(sampleShape(s, st.time).z, (v) => { keyAt(s, st.time).z = Math.max(-200, Math.min(1000, v)); })),
-    field("Visible from", number(s.start, (v) => { s.start = clampTime(v); })),
-    field("Visible to", number(s.end, (v) => { s.end = clampTime(v); })),
-    el("div", { className: "row" },
-      el("button", { textContent: "Forward", onclick: () => { moveShape(s.id, 1); commit(); } }),
-      el("button", { textContent: "Back", onclick: () => { moveShape(s.id, -1); commit(); } })),
-    el("p", { className: "hint", textContent: `${s.keys[0].pts.length} points, ${s.keys.length} keyframes. Lower depth is nearer and shifts more when the toy moves.` }),
+    el("p", {
+      className: "hint",
+      textContent: l.type === "path"
+        ? "Drag points and handles on the canvas. Double-click an edge to add a point, Alt+click a point to make it sharp or smooth, Alt+drag a handle to break it."
+        : "Lower depth is nearer and moves more when the toy is shaken.",
+    }),
   ];
 }
 
@@ -84,57 +82,47 @@ function palettePanel() {
       el("button", {
         textContent: "+ Variant",
         onclick: () => {
-          const base = project.variants[st.variant];
-          project.variants.push({ name: `Variant ${project.variants.length + 1}`, colors: [...base.colors] });
+          project.variants.push({ name: `Variant ${project.variants.length + 1}`, colors: [...project.variants[st.variant].colors] });
           commit();
         },
       }),
+      el("button", { textContent: "+ Colour", onclick: () => { project.variants.forEach((v) => v.colors.push("#ffffff")); commit(); } }),
       el("button", {
-        textContent: "+ Colour",
-        onclick: () => { project.variants.forEach((v) => v.colors.push("#ffffff")); commit(); },
-      }),
-      el("button", {
-        textContent: "Delete variant",
-        disabled: project.variants.length < 2,
-        onclick: () => {
-          project.variants.splice(st.variant, 1);
-          st.variant = Math.max(0, st.variant - 1);
-          commit();
-        },
+        textContent: "Delete variant", disabled: project.variants.length < 2,
+        onclick: () => { project.variants.splice(st.variant, 1); st.variant = Math.max(0, st.variant - 1); commit(); },
       })),
   ];
 }
 
 function projectPanel() {
   const spring = (label, key, min, max, step) => field(label, el("input", {
-    type: "range", min, max, step, value: st.spring[key],
-    oninput: (e) => { st.spring[key] = Number(e.target.value); },
+    type: "range", min, max, step, value: st.spring[key], oninput: (e) => { st.spring[key] = Number(e.target.value); },
   }));
-
   return [
     el("h3", { textContent: "Project" }),
     field("Name", el("input", { value: project.name, onchange: (e) => { project.name = e.target.value; commit(); } })),
     field("Length (ms)", number(project.duration, (v) => {
       project.duration = Math.max(100, Math.min(60000, Math.round(v)));
-      st.time = Math.min(st.time, project.duration - 1);
-      project.shapes.forEach((s) => { s.end = Math.min(s.end, project.duration); });
+      project.layers.forEach((l) => { l.out = Math.min(l.out, project.duration); l.in = Math.min(l.in, l.out - 1); });
     })),
+    field("Frame rate", number(project.fps, (v) => { project.fps = Math.max(1, Math.min(120, Math.round(v))); })),
     el("h3", { textContent: "Shake preview" }),
     spring("Stiffness", "k", 10, 200, 1),
     spring("Damping", "c", 1, 20, 0.1),
     spring("Strength", "gain", 0, 2, 0.05),
-    el("p", { className: "hint", textContent: "Drag on the emulator to shake it. These values are set in the firmware." }),
+    el("p", { className: "hint", textContent: "Drag on the emulator to shake it. Copy values you like into firmware config.h." }),
   ];
 }
 
 let shown = "";
 
 function render() {
-  const s = activeShape();
-  const signature = JSON.stringify([s?.id, st.variant, Math.round(st.time), project.variants, project.name, project.duration, s && [s.name, s.start, s.end, s.colorKeys, s.keys.length]]);
-  if (signature === shown || host.contains(document.activeElement) && document.activeElement.tagName === "INPUT" && document.activeElement.type !== "color") return;
+  const l = activeLayer();
+  const signature = JSON.stringify([l?.id, st.variant, st.time, project.variants, project.name, project.duration, project.fps, l]);
+  const focused = document.activeElement;
+  if (signature === shown || (host.contains(focused) && focused.tagName === "INPUT" && focused.type !== "color")) return;
   shown = signature;
-  host.replaceChildren(...(s ? shapePanel(s) : []), ...palettePanel(), ...(s ? [] : projectPanel()));
+  host.replaceChildren(...(l ? layerPanel(l) : projectPanel()), ...palettePanel());
 }
 
 export function setupInspector() {
