@@ -4,7 +4,7 @@
 import { readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { compile, pack, toHeader } from "../scr/compiler.js";
-import { validateProject } from "../scr/states.js";
+import { validateProject } from "../scr/model.js";
 
 const args = process.argv.slice(2);
 const o = args.indexOf("-o");

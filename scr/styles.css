@@ -116,7 +116,9 @@ input[type="range"] { padding: 0; }
   white-space: nowrap;
 }
 
-.field { display: grid; grid-template-columns: 84px minmax(0, 1fr); align-items: center; gap: 6px; margin-bottom: 6px; }
+.field { display: grid; grid-template-columns: 92px minmax(0, 1fr); align-items: center; gap: 6px; margin-bottom: 6px; }
+.field .inputs { display: flex; gap: 4px; min-width: 0; }
+.field .inputs > * { flex: 1 1 0; min-width: 0; }
 .row { display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
 .swatches { display: flex; gap: 3px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; }
 .swatches input[type="text"] { flex: 1 0 100%; }

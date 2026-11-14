@@ -1,9 +1,19 @@
-import { project, programState as st, commit, refresh, onChange, undo, redo, loadProject, newProject, activeShape, getShape, removePoints, deleteShapes, duplicateShapes, select } from "./states.js";
+// Top bar, tool buttons, layer list and every keyboard shortcut.
+
+import {
+  project, programState as st, commit, refresh, onChange, undo, redo, loadProject, newProject, activeLayer,
+  selectedLayers, selectedKeys, deleteLayers, duplicateLayers, select, stepFrames, setTime, lastFrame, tolerance, frameMs,
+} from "./states.js";
+import { addKey, removeKeys, removeVertices, propsOf } from "./model.js";
 import { compile, pack, toHeader, RAM_LIMIT } from "./compiler.js";
-import { finishPen } from "./editor.js";
+import { applyCurve } from "./curves.js";
+import { EASY_EASE } from "./functions.js";
+import { pen } from "./editor.js";
 
 const at = (id) => document.getElementById(id);
-const TOOLS = [["select", "Select (V)", "v"], ["pen", "Polygon (P)", "p"], ["rect", "Rectangle (R)", "r"], ["ellipse", "Ellipse (E)", "e"]];
+const TOOLS = [["select", "Selection (V)", "v"], ["pen", "Pen (G)", "g"], ["rect", "Rectangle (R)", "r"], ["ellipse", "Ellipse (E)", "e"]];
+// Alt+Shift+letter adds a key to one property, like After Effects.
+const PROP_KEYS = { p: "position", s: "scale", r: "rotation", a: "anchor", d: "depth" };
 
 function download(name, data, type) {
   const a = document.createElement("a");
@@ -23,8 +33,7 @@ function setStatus(text, error = false) {
 function showBudget() {
   const { errors, bytes, ram } = compile(project);
   if (errors.length) return setStatus(errors[0], true);
-  const perAnimation = 60 * bytes.length;
-  setStatus(`${bytes.length} B flash, ${Math.round(ram / RAM_LIMIT * 100)}% of player RAM. 60 like this: ${(perAnimation / 1024).toFixed(0)} KB`);
+  setStatus(`${bytes.length} B flash, ${Math.round(ram / RAM_LIMIT * 100)}% of player RAM`);
 }
 
 function exportPack(asHeader) {
@@ -36,44 +45,73 @@ function exportPack(asHeader) {
 }
 
 function deleteSelection() {
-  const s = activeShape();
-  if (s && st.points.size) {
-    if (removePoints(s, st.points)) st.points.clear();
-    else setStatus("A shape needs at least 3 points", true);
-  } else if (st.keys.size) {
-    for (const item of st.keys) {
-      const [sid, kid] = item.split("|").map(Number);
-      const shape = getShape(sid);
-      if (shape && shape.keys.length > 1) shape.keys = shape.keys.filter((k) => k.id !== kid);
+  const l = activeLayer();
+  if (st.keys.size) {
+    const byTrack = new Map();
+    for (const { track, key } of selectedKeys()) {
+      if (!byTrack.has(track)) byTrack.set(track, new Set());
+      byTrack.get(track).add(key.id);
     }
+    byTrack.forEach((ids, track) => removeKeys(track, ids, st.time));
     st.keys.clear();
-  } else if (st.shapes.size) {
-    deleteShapes(st.shapes);
+  } else if (l?.type === "path" && st.vertices.size) {
+    if (removeVertices(l, st.vertices)) st.vertices.clear();
+    else return setStatus("A path needs at least 3 points", true);
+  } else if (st.layers.size) {
+    deleteLayers(st.layers);
   }
   commit();
 }
 
-function setTool(tool) {
-  st.tool = tool;
-  refresh();
+function addKeys(names) {
+  for (const l of selectedLayers()) {
+    for (const name of names ?? propsOf(l)) addKey(l.props[name], st.time, tolerance());
+    st.expanded.add(l.id);
+  }
+  commit();
 }
+
+// Alt+[ / Alt+]: the layer starts at, or ends after, the frame under the playhead.
+function trim(side) {
+  const end = Math.min(project.duration, Math.round(st.time + frameMs()));
+  for (const l of selectedLayers()) {
+    if (side === "in") l.in = Math.min(st.time, l.out - 1);
+    else l.out = Math.max(end, l.in + 1);
+  }
+  commit();
+}
+
+const setTool = (tool) => { st.tool = tool; pen.cancel(); refresh(); };
 
 function onKey(e) {
   if (["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName)) return;
-  const k = e.key.toLowerCase();
+  const k = e.key.toLowerCase(), handled = () => e.preventDefault();
+
   if (e.ctrlKey || e.metaKey) {
-    if (k === "z") { e.shiftKey ? redo() : undo(); e.preventDefault(); }
-    else if (k === "y") { redo(); e.preventDefault(); }
-    else if (k === "d") { duplicateShapes(st.shapes); commit(); e.preventDefault(); }
-    else if (k === "s") { at("btn-save").click(); e.preventDefault(); }
+    if (k === "z") { e.shiftKey ? redo() : undo(); handled(); }
+    else if (k === "y") { redo(); handled(); }
+    else if (k === "d") { duplicateLayers(st.layers); commit(); handled(); }
+    else if (k === "s") { at("btn-save").click(); handled(); }
     return;
   }
+  if (e.altKey && e.shiftKey && PROP_KEYS[k]) { addKeys([PROP_KEYS[k]]); return handled(); }
+  if (e.altKey && (e.code === "BracketLeft" || e.code === "BracketRight")) { trim(e.code === "BracketLeft" ? "in" : "out"); return handled(); }
+  if (e.altKey) return;
+
   const tool = TOOLS.find((t) => t[2] === k);
-  if (tool) setTool(tool[0]);
-  else if (k === " ") { st.playing = !st.playing; refresh(); e.preventDefault(); }
-  else if (k === "delete" || k === "backspace") deleteSelection();
-  else if (k === "enter") finishPen.run();
-  else if (k === "escape") { select([]); st.keys.clear(); setTool("select"); }
+  if (tool) return setTool(tool[0]);
+  switch (e.key) {
+    case " ": st.playing = !st.playing; if (!st.playing) setTime(st.time); else refresh(); return handled();
+    case "PageDown": stepFrames(e.shiftKey ? 10 : 1); return handled();
+    case "PageUp": stepFrames(e.shiftKey ? -10 : -1); return handled();
+    case "Home": setTime(0); return handled();
+    case "End": setTime(lastFrame()); return handled();
+    case "Delete": case "Backspace": deleteSelection(); return handled();
+    case "Enter": pen.finish(); return handled();
+    case "Escape": pen.cancel(); select([]); setTool("select"); return;
+    case "F9": applyCurve(EASY_EASE); commit(); return handled();
+  }
+  if (k === "k") addKeys();
 }
 
 export function setupUI() {
@@ -85,7 +123,7 @@ export function setupUI() {
     at("tools").append(b);
   }
 
-  at("btn-new").onclick = () => { if (confirm("Start a new project? Unsaved work stays in Undo.")) newProject(); };
+  at("btn-new").onclick = () => { if (confirm("Start a new project? The current one stays in Undo.")) newProject(); };
   at("btn-open").onclick = () => at("file-open").click();
   at("file-open").onchange = async (e) => {
     const file = e.target.files[0];
@@ -99,22 +137,19 @@ export function setupUI() {
   at("btn-redo").onclick = redo;
   at("btn-export-h").onclick = () => exportPack(true);
   at("btn-export-bin").onclick = () => exportPack(false);
-  at("btn-play").onclick = () => { st.playing = !st.playing; refresh(); };
+  at("btn-play").onclick = () => { st.playing = !st.playing; if (!st.playing) setTime(st.time); else refresh(); };
   at("onion").onchange = (e) => { st.onion = e.target.checked; };
   addEventListener("keydown", onKey);
 
-  const objects = at("objects");
+  const layers = at("objects");
   const paint = () => {
     document.querySelectorAll("#tools button").forEach((b) => b.classList.toggle("active", b.dataset.tool === st.tool));
     at("btn-play").textContent = st.playing ? "Pause" : "Play";
-    objects.replaceChildren(...[...project.shapes].reverse().map((s) => {
+    layers.replaceChildren(...[...project.layers].reverse().map((l) => {
       const b = document.createElement("button");
-      b.textContent = s.name;
-      b.classList.toggle("active", st.shapes.has(s.id));
-      b.onclick = (e) => {
-        if (e.shiftKey) st.shapes.add(s.id); else select([s.id]);
-        refresh();
-      };
+      b.textContent = l.name;
+      b.classList.toggle("active", st.layers.has(l.id));
+      b.onclick = (e) => { if (e.shiftKey) st.layers.add(l.id); else select([l.id]); refresh(); };
       return b;
     }));
     showBudget();
@@ -124,7 +159,7 @@ export function setupUI() {
   try {
     const autosave = localStorage.getItem("epsilon.autosave");
     if (autosave) loadProject(autosave);
-  } catch { /* a damaged autosave must not stop the editor opening */ }
+  } catch { /* a damaged or outdated autosave must not stop the editor opening */ }
   paint();
 
   const tick = () => {
